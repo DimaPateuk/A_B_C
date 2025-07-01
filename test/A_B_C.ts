@@ -4,6 +4,10 @@ import dotenv from "dotenv";
 import { expect } from "chai";
 dotenv.config();
 
+const MULTICALL_ADDRESS = "0x5ba1e12693dc8f9c48aad8770482f4739beed696";
+const MULTICALL_ABI = [
+  "function aggregate(tuple(address target, bytes callData)[] calls) external view returns (uint256 blockNumber, bytes[] returnData)",
+];
 const USDT = ethers.getAddress("0xdac17f958d2ee523a2206206994597c13d831ec7");
 const USDC = ethers.getAddress("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 const DAI = ethers.getAddress("0x6b175474e89094c44da98b954eedeac495271d0f");
@@ -40,7 +44,7 @@ const MIDDLES = [
   { name: "WBTC", address: WBTC },
 ];
 
-const FEES = [100, 500];
+const FEES = [100, 500, 3000, 10000];
 const INPUT_AMOUNT = 1000n * 10n ** 6n; // 1000 units with 6 decimals
 
 describe("A_B_C multi-swap tests", function () {
@@ -143,41 +147,119 @@ describe("A_B_C multi-swap tests", function () {
       const whale = await ethers.getSigner(token.whale);
 
       const tokenContract = await ethers.getContractAt("IERC20", token.address);
+
       const ContractFactory = await ethers.getContractFactory("A_B_C", whale);
+
       contract = await ContractFactory.deploy(
         UNISWAP_V3_ROUTER,
         UNISWAP_V3_QUOTER
       );
       await contract.waitForDeployment();
+
       const contractAddress = await contract.getAddress();
 
-      const whaleBalance = await tokenContract.balanceOf(whale.address);
-      expect(whaleBalance).to.be.gt(0n);
-      console.log(whaleBalance);
+      const whaleBalanceBefore = await tokenContract.balanceOf(whale.address);
 
-      // Transfer entire whale balance to contract
+      expect(whaleBalanceBefore).to.be.gt(0n);
+
       await tokenContract
         .connect(whale)
-        .transfer(contractAddress, whaleBalance);
+        .transfer(contractAddress, whaleBalanceBefore);
 
-      const contractTokenBalance = await tokenContract.balanceOf(
+      expect(await tokenContract.balanceOf(whale.address)).to.be.eq(0n);
+
+      const contractBalanceAfterTransfer = await tokenContract.balanceOf(
         contractAddress
       );
 
-      console.log(contractTokenBalance);
-      expect(contractTokenBalance).to.equal(whaleBalance);
-      const recipientBefore = await tokenContract.balanceOf(contractAddress);
-      console.log(await contract.owner(), whale.address);
-      // Withdraw all tokens to recipient
+      expect(contractBalanceAfterTransfer).to.be.eq(whaleBalanceBefore);
+
       await contract.connect(whale).withdraw(token.address, whale.address);
 
-      // const recipientAfter = await tokenContract.balanceOf(
-      //   await whale.getAddress()
-      // );
-      // const contractAfter = await tokenContract.balanceOf(contractAddress);
+      const whaleBalanceAfter = await tokenContract.balanceOf(
+        await whale.getAddress()
+      );
 
-      // expect(recipientAfter - recipientBefore).to.equal(contractTokenBalance);
-      // expect(contractAfter).to.equal(0n);
+      expect(whaleBalanceAfter).to.be.eq(whaleBalanceBefore);
+
+      const contractBalanceAfter = await tokenContract.balanceOf(
+        contractAddress
+      );
+
+      expect(contractBalanceAfter).to.equal(0n);
     });
   }
+
+  it.skip("should multicall getQuoteAtoBtoC and log results", async () => {
+    const multicall = new ethers.Contract(
+      MULTICALL_ADDRESS,
+      MULTICALL_ABI,
+      ethers.provider
+    );
+
+    const calls: { target: string; callData: string }[] = [];
+
+    for (const tokenA of TOKENS) {
+      for (const tokenC of TOKENS) {
+        for (const middle of MIDDLES) {
+          for (const feeAB of FEES) {
+            for (const feeBC of FEES) {
+              if (tokenA.address === tokenC.address && feeAB === feeBC) {
+                continue;
+              }
+
+              const callData = contract.interface.encodeFunctionData(
+                "getQuoteAtoBtoC",
+                [
+                  tokenA.address,
+                  middle.address,
+                  tokenC.address,
+                  feeAB,
+                  feeBC,
+                  INPUT_AMOUNT,
+                ]
+              );
+
+              calls.push({
+                target: await contract.getAddress(),
+                callData,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    const [, results] = await multicall.aggregate(calls);
+
+    let i = 0;
+    for (const tokenA of TOKENS) {
+      for (const tokenC of TOKENS) {
+        for (const middle of MIDDLES) {
+          for (const feeAB of FEES) {
+            for (const feeBC of FEES) {
+              if (tokenA.address === tokenC.address && feeAB === feeBC) {
+                continue;
+              }
+
+              const label = `${tokenA.name} → ${middle.name}(${feeAB}) → ${tokenC.name}(${feeBC})`;
+              const [quote] = contract.interface.decodeFunctionResult(
+                "getQuoteAtoBtoC",
+                results[i]
+              );
+
+              const diff = quote - INPUT_AMOUNT;
+              const percent = (Number(diff) / Number(INPUT_AMOUNT)) * 100;
+              console.log(
+                `[${label}] Quote: ${quote} | PnL: ${percent.toFixed(2)}%`
+              );
+              i++;
+            }
+          }
+        }
+      }
+    }
+
+    expect(results.length).to.be.greaterThan(0);
+  });
 });
